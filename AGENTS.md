@@ -248,6 +248,7 @@ When processing a daily log:
 - Write in encyclopedia style - factual, concise, self-contained
 - Every article must have YAML frontmatter
 - Every article must link back to its source daily logs
+- **Cross-link with Wiki:** A sibling wiki lives at `../../wiki/`. If a knowledge article covers a topic that has a corresponding wiki page (e.g., `xcm-message-parsing` ↔ `wiki/concepts/xcm.md`), add a `## Wiki Context` section at the bottom with a relative path link. This connects engineering lessons to their domain context.
 
 ### 2. Query (Ask the Knowledge Base)
 
@@ -283,6 +284,7 @@ Output: a markdown report with severity levels (error, warning, suggestion).
 - **File naming:** lowercase, hyphens for spaces (e.g., `supabase-row-level-security.md`)
 - **Frontmatter:** Every article must have YAML frontmatter with at minimum: title, sources, created, updated
 - **Sources:** Always link back to the daily log(s) that contributed to an article
+- **Tags:** Use the shared vocabulary from the parent project's CLAUDE.md. Common tags: `polkadot`, `substrate`, `xcm`, `react`, `effector`, `debugging`, `architecture`, `testing`. This ensures grep-by-tag works across both wiki and knowledge base.
 
 ---
 

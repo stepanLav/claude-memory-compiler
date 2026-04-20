@@ -2,8 +2,9 @@
 SessionStart hook - injects knowledge base context into every conversation.
 
 This is the "context injection" layer. When Claude Code starts a session,
-this hook reads the knowledge base index and recent daily log, then injects
-them as additional context so Claude always "remembers" what it has learned.
+this hook reads both knowledge bases (wiki + compiled knowledge) and the
+recent daily log, then injects them as additional context so Claude always
+"remembers" what it has learned.
 
 Configure in .claude/settings.json:
 {
@@ -21,11 +22,15 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Paths relative to project root
+# Paths relative to project root (claude-memory-compiler/)
 ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE_DIR = ROOT / "knowledge"
 DAILY_DIR = ROOT / "daily"
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
+
+# Wiki lives one level up in the parent project (claude-power/)
+PROJECT_ROOT = ROOT.parent
+WIKI_INDEX_FILE = PROJECT_ROOT / "wiki" / "index.md"
 
 MAX_CONTEXT_CHARS = 20_000
 MAX_LOG_LINES = 30
@@ -55,10 +60,15 @@ def build_context() -> str:
     today = datetime.now(timezone.utc).astimezone()
     parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
 
-    # Knowledge base index (the core retrieval mechanism)
+    # Wiki index (domain knowledge — what things are)
+    if WIKI_INDEX_FILE.exists():
+        wiki_content = WIKI_INDEX_FILE.read_text(encoding="utf-8")
+        parts.append(f"## Wiki Index (Domain Knowledge)\n\n{wiki_content}")
+
+    # Knowledge base index (engineering lessons — what was learned)
     if INDEX_FILE.exists():
         index_content = INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Knowledge Base Index\n\n{index_content}")
+        parts.append(f"## Knowledge Base Index (Engineering Lessons)\n\n{index_content}")
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
 

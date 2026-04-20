@@ -49,6 +49,12 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
     schema = AGENTS_FILE.read_text(encoding="utf-8")
     wiki_index = read_wiki_index()
 
+    # Read the sibling wiki index for cross-referencing
+    parent_wiki_index_path = ROOT_DIR.parent / "wiki" / "index.md"
+    domain_wiki_index = ""
+    if parent_wiki_index_path.exists():
+        domain_wiki_index = parent_wiki_index_path.read_text(encoding="utf-8")
+
     # Read existing articles for context
     existing_articles_context = ""
     existing = {}
@@ -79,6 +85,13 @@ and extract knowledge into structured wiki articles.
 
 {existing_articles_context if existing_articles_context else "(No existing articles yet)"}
 
+## Domain Wiki Index (sibling wiki at ../../wiki/)
+
+{domain_wiki_index if domain_wiki_index else "(No domain wiki found)"}
+
+Use this index to add `## Wiki Context` sections to knowledge articles when a matching
+domain page exists. Link using relative paths from knowledge/, e.g. `../../wiki/concepts/xcm.md`.
+
 ## Daily Log to Compile
 
 **File:** {log_path.name}
@@ -103,7 +116,10 @@ Read the daily log above and compile it into wiki articles following the schema 
    - Read the existing article, add the new information, add the source to frontmatter
 5. **Update knowledge/index.md** - Add new entries to the table
    - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
-6. **Append to knowledge/log.md** - Add a timestamped entry:
+6. **Cross-link with domain wiki** - If an article covers a topic matching a page in the
+   Domain Wiki Index above, add a `## Wiki Context` section at the bottom with a relative
+   link, e.g.: `- [XCM](../../wiki/concepts/xcm.md) — domain overview of Cross-Consensus Messaging`
+7. **Append to knowledge/log.md** - Add a timestamped entry:
    ```
    ## [{timestamp}] compile | {log_path.name}
    - Source: daily/{log_path.name}
