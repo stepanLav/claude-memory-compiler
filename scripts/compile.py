@@ -163,7 +163,19 @@ Read the daily log above and compile it into wiki articles following the schema 
                 cost = message.total_cost_usd or 0.0
                 print(f"  Cost: ${cost:.4f}")
     except Exception as e:
+        import traceback
+
         print(f"  Error: {e}")
+        stderr_out = getattr(e, "stderr", None)
+        if stderr_out:
+            print(f"  Stderr: {stderr_out}")
+        print(traceback.format_exc())
+        # The API cost was incurred even though compilation failed - record it
+        # so total_cost stays honest, but don't mark the log as ingested
+        # (a retry will pick it up again).
+        if cost:
+            state["total_cost"] = state.get("total_cost", 0.0) + cost
+            save_state(state)
         return 0.0
 
     # Update state
@@ -234,6 +246,23 @@ def main():
     articles = list_wiki_articles()
     print(f"\nCompilation complete. Total cost: ${total_cost:.2f}")
     print(f"Knowledge base: {len(articles)} articles")
+
+    # Free structural lint so broken links surface the day they appear
+    # instead of accumulating silently until a manual lint run.
+    try:
+        import subprocess
+
+        lint = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "lint.py"), "--structural-only"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        for line in lint.stdout.splitlines():
+            if line.startswith(("Results:", "Report saved")):
+                print(line)
+    except Exception as e:
+        print(f"Post-compile lint skipped: {e}")
 
 
 if __name__ == "__main__":

@@ -142,6 +142,19 @@ respond with exactly: FLUSH_OK
 COMPILE_AFTER_HOUR = 18  # 6 PM local time
 
 
+def cleanup_stale_context_files(max_age_days: int = 7) -> None:
+    """Remove session-flush context files left behind by flush runs that
+    died before their own cleanup (crash, kill, power loss)."""
+    cutoff = time.time() - max_age_days * 86400
+    for stale in SCRIPTS_DIR.glob("session-flush-*.md"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+                logging.info("Removed stale context file: %s", stale.name)
+        except OSError:
+            pass
+
+
 def maybe_trigger_compilation() -> None:
     """If it's past the compile hour and today's log hasn't been compiled, run compile.py."""
     import subprocess as _sp
@@ -243,6 +256,9 @@ def main():
 
     # Clean up context file
     context_file.unlink(missing_ok=True)
+
+    # Sweep leftovers from flush runs that never reached their own cleanup
+    cleanup_stale_context_files()
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.
