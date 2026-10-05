@@ -85,12 +85,13 @@ and extract knowledge into structured wiki articles.
 
 {existing_articles_context if existing_articles_context else "(No existing articles yet)"}
 
-## Domain Wiki Index (sibling wiki at ../../wiki/)
+## Domain Wiki Index (domain wiki at <project root>/wiki/)
 
 {domain_wiki_index if domain_wiki_index else "(No domain wiki found)"}
 
 Use this index to add `## Wiki Context` sections to knowledge articles when a matching
-domain page exists. Link using relative paths from knowledge/, e.g. `../../wiki/concepts/xcm.md`.
+domain page exists. Links are relative to the article file: from `knowledge/concepts/<slug>.md`
+or `knowledge/connections/<slug>.md` that is `../../../wiki/...`, e.g. `../../../wiki/concepts/xcm.md`.
 
 ## Daily Log to Compile
 
@@ -118,7 +119,7 @@ Read the daily log above and compile it into wiki articles following the schema 
    - Each entry: `| [[path/slug]] | One-line summary | source-file | {timestamp[:10]} |`
 6. **Cross-link with domain wiki** - If an article covers a topic matching a page in the
    Domain Wiki Index above, add a `## Wiki Context` section at the bottom with a relative
-   link, e.g.: `- [XCM](../../wiki/concepts/xcm.md) — domain overview of Cross-Consensus Messaging`
+   link (relative to the article file), e.g.: `- [XCM](../../../wiki/concepts/xcm.md) — domain overview of Cross-Consensus Messaging`
 7. **Append to knowledge/log.md** - Add a timestamped entry:
    ```
    ## [{timestamp}] compile | {log_path.name}
