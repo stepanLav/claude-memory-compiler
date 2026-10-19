@@ -16,8 +16,8 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, QA_DIR, now_iso
-from utils import load_state, read_all_wiki_content, save_state
+from config import COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, QA_DIR, now_iso
+from utils import compact_table_whitespace, load_state, read_wiki_index, save_state
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
@@ -32,7 +32,7 @@ async def run_query(question: str, file_back: bool = False) -> str:
         query,
     )
 
-    wiki_content = read_all_wiki_content()
+    wiki_index = compact_table_whitespace(read_wiki_index())
 
     tools = ["Read", "Glob", "Grep"]
     if file_back:
@@ -65,14 +65,15 @@ consulting the knowledge base below.
 
 1. Read the INDEX section first - it lists every article with a one-line summary
 2. Identify 3-10 articles that are relevant to the question
-3. Read those articles carefully (they're included below)
+3. Read those articles from disk with the Read tool (paths are `{KNOWLEDGE_DIR}/<slug>.md`);
+   use Grep over `{KNOWLEDGE_DIR}` when the index summaries are not enough
 4. Synthesize a clear, thorough answer
 5. Cite your sources using [[wikilinks]] (e.g., [[concepts/supabase-auth]])
 6. If the knowledge base doesn't contain relevant information, say so honestly
 
-## Knowledge Base
+## Knowledge Base Index
 
-{wiki_content}
+{wiki_index}
 
 ## Question
 
@@ -91,6 +92,8 @@ consulting the knowledge base below.
                 allowed_tools=tools,
                 permission_mode="acceptEdits",
                 max_turns=15,
+                model=COMPILE_MODEL,
+                fallback_model=FALLBACK_MODEL,
             ),
         ):
             if isinstance(message, AssistantMessage):

@@ -23,10 +23,21 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from config import (
+    COMPILE_LOCK_FILE,
+    COMPILE_LOCK_STALE_SECONDS,
+    FALLBACK_MODEL,
+    FLUSH_MODEL,
+)
+from utils import (  # noqa: F401  (re-exported for tests and callers)
+    acquire_compile_lock,
+    acquire_session_lock,
+    release_compile_lock,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 DAILY_DIR = ROOT / "daily"
 SCRIPTS_DIR = ROOT / "scripts"
-STATE_FILE = SCRIPTS_DIR / "last-flush.json"
 LOG_FILE = SCRIPTS_DIR / "flush.log"
 
 # Set up file-based logging so we can verify the background process ran.
@@ -38,19 +49,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-
-
-def load_flush_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def save_flush_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
 
 
 def append_to_daily_log(content: str, section: str = "Session") -> None:
@@ -115,6 +113,7 @@ respond with exactly: FLUSH_OK
 {context}"""
 
     response = ""
+    stderr_lines: list[str] = []
 
     try:
         async for message in query(
@@ -123,6 +122,9 @@ respond with exactly: FLUSH_OK
                 cwd=str(ROOT),
                 allowed_tools=[],
                 max_turns=2,
+                model=FLUSH_MODEL,
+                fallback_model=FALLBACK_MODEL,
+                stderr=lambda line: stderr_lines.append(line.rstrip()),
             ),
         ):
             if isinstance(message, AssistantMessage):
@@ -134,7 +136,15 @@ respond with exactly: FLUSH_OK
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
+        if stderr_lines:
+            logging.error("CLI stderr (last %d lines):\n%s", min(len(stderr_lines), 20),
+                          "\n".join(stderr_lines[-20:]))
+        # The CLI reports API failures as assistant text, so if we got any
+        # text back it is the most useful thing to record.
+        detail = response.strip() or (stderr_lines[-1] if stderr_lines else "")
         response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
+        if detail:
+            response += f"\nDetail: {detail[:500]}"
 
     return response
 
@@ -143,16 +153,18 @@ COMPILE_AFTER_HOUR = 18  # 6 PM local time
 
 
 def cleanup_stale_context_files(max_age_days: int = 7) -> None:
-    """Remove session-flush context files left behind by flush runs that
+    """Remove context files and session locks left behind by flush runs that
     died before their own cleanup (crash, kill, power loss)."""
     cutoff = time.time() - max_age_days * 86400
-    for stale in SCRIPTS_DIR.glob("session-flush-*.md"):
-        try:
-            if stale.stat().st_mtime < cutoff:
-                stale.unlink()
-                logging.info("Removed stale context file: %s", stale.name)
-        except OSError:
-            pass
+    patterns = ("session-flush-*.md", "flush-context-*.md", "session-lock-*")
+    for pattern in patterns:
+        for stale in SCRIPTS_DIR.glob(pattern):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+                    logging.info("Removed stale file: %s", stale.name)
+            except OSError:
+                pass
 
 
 def maybe_trigger_compilation() -> None:
@@ -185,6 +197,16 @@ def maybe_trigger_compilation() -> None:
     if not compile_script.exists():
         return
 
+    # compile.py takes this lock itself; checking here just avoids spawning a
+    # process that would exit immediately.
+    try:
+        if COMPILE_LOCK_FILE.exists() and \
+                time.time() - COMPILE_LOCK_FILE.stat().st_mtime < COMPILE_LOCK_STALE_SECONDS:
+            logging.info("Compile already running (lock present), not spawning another")
+            return
+    except OSError:
+        pass
+
     logging.info("End-of-day compilation triggered (after %d:00)", COMPILE_AFTER_HOUR)
 
     cmd = ["uv", "run", "--directory", str(ROOT), "python", str(compile_script)]
@@ -216,12 +238,9 @@ def main():
         logging.error("Context file not found: %s", context_file)
         return
 
-    # Deduplication: skip if same session was flushed within 60 seconds
-    state = load_flush_state()
-    if (
-        state.get("session_id") == session_id
-        and time.time() - state.get("timestamp", 0) < 60
-    ):
+    # Deduplication: the same hook registered in two settings files fires twice
+    # in the same second. Only the process that wins the atomic lock proceeds.
+    if not acquire_session_lock(session_id, SCRIPTS_DIR):
         logging.info("Skipping duplicate flush for session %s", session_id)
         context_file.unlink(missing_ok=True)
         return
@@ -233,7 +252,7 @@ def main():
         context_file.unlink(missing_ok=True)
         return
 
-    logging.info("Flushing session %s: %d chars", session_id, len(context))
+    logging.info("Flushing session %s: %d chars (model=%s)", session_id, len(context), FLUSH_MODEL)
 
     # Run the LLM extraction
     response = asyncio.run(run_flush(context))
@@ -250,9 +269,6 @@ def main():
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session")
-
-    # Update dedup state
-    save_flush_state({"session_id": session_id, "timestamp": time.time()})
 
     # Clean up context file
     context_file.unlink(missing_ok=True)

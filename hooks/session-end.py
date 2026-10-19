@@ -38,7 +38,7 @@ logging.basicConfig(
 
 MAX_TURNS = 30
 MAX_CONTEXT_CHARS = 15_000
-MIN_TURNS_TO_FLUSH = 1
+MIN_TURNS_TO_FLUSH = 6  # user+assistant messages; <3 exchanges is never worth an LLM call
 
 
 def extract_conversation_context(transcript_path: Path) -> tuple[str, int]:
@@ -106,10 +106,10 @@ def main() -> None:
         return
 
     session_id = hook_input.get("session_id", "unknown")
-    source = hook_input.get("source", "unknown")
+    reason = hook_input.get("reason", "unknown")
     transcript_path_str = hook_input.get("transcript_path", "")
 
-    logging.info("SessionEnd fired: session=%s source=%s", session_id, source)
+    logging.info("SessionEnd fired: session=%s reason=%s", session_id, reason)
 
     if not transcript_path_str or not isinstance(transcript_path_str, str):
         logging.info("SKIP: no transcript path")

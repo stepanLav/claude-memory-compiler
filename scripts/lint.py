@@ -15,7 +15,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -24,7 +24,8 @@ from utils import (
     list_raw_files,
     list_wiki_articles,
     load_state,
-    read_all_wiki_content,
+    compact_table_whitespace,
+    read_wiki_index,
     save_state,
     wiki_article_exists,
 )
@@ -155,16 +156,20 @@ async def check_contradictions() -> list[dict]:
         query,
     )
 
-    wiki_content = read_all_wiki_content()
+    wiki_index = compact_table_whitespace(read_wiki_index())
 
     prompt = f"""Review this knowledge base for contradictions, inconsistencies, or
 conflicting claims across articles.
 
-## Knowledge Base
+## Knowledge Base Index
 
-{wiki_content}
+{wiki_index}
 
 ## Instructions
+
+Articles live under `{KNOWLEDGE_DIR}`. Pick clusters of articles whose index summaries
+overlap or look conflicting, Read those articles, and compare their claims. You cannot
+read everything; prioritise topics with 3+ articles.
 
 Look for:
 - Direct contradictions (article A says X, article B says not-X)
@@ -185,8 +190,10 @@ Do NOT output anything else - no preamble, no explanation, just the formatted li
             prompt=prompt,
             options=ClaudeAgentOptions(
                 cwd=str(ROOT_DIR),
-                allowed_tools=[],
-                max_turns=2,
+                allowed_tools=["Read", "Glob", "Grep"],
+                max_turns=25,
+                model=COMPILE_MODEL,
+                fallback_model=FALLBACK_MODEL,
             ),
         ):
             if isinstance(message, AssistantMessage):

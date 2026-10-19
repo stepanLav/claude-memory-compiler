@@ -6,19 +6,13 @@ this hook reads both knowledge bases (wiki + compiled knowledge) and the
 recent daily log, then injects them as additional context so Claude always
 "remembers" what it has learned.
 
-Configure in .claude/settings.json:
-{
-    "hooks": {
-        "SessionStart": [{
-            "matcher": "",
-            "command": "uv run python hooks/session-start.py"
-        }]
-    }
-}
+Each section gets its own character budget so a large wiki index can never
+crowd out the knowledge base index or the daily log (which is what happened
+when a single 20k cap was applied to the concatenation).
 """
 
 import json
-import sys
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,61 +26,134 @@ INDEX_FILE = KNOWLEDGE_DIR / "index.md"
 PROJECT_ROOT = ROOT.parent
 WIKI_INDEX_FILE = PROJECT_ROOT / "wiki" / "index.md"
 
-MAX_CONTEXT_CHARS = 20_000
-MAX_LOG_LINES = 30
+# Per-section budgets (characters). ~4 chars per token.
+WIKI_INDEX_BUDGET = 20_000
+KB_INDEX_BUDGET = 12_000
+DAILY_LOG_BUDGET = 5_000
+MAX_CONTEXT_CHARS = WIKI_INDEX_BUDGET + KB_INDEX_BUDGET + DAILY_LOG_BUDGET + 2_000
+MAX_LOG_LINES = 40
+SUMMARY_MAX_CHARS = 110
+
+_ROW_RE = re.compile(r"^\|\s*\[\[([^\]]+)\]\]\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(\S+)\s*\|\s*$")
 
 
-def get_recent_log() -> str:
-    """Read the most recent daily log (today or yesterday)."""
-    today = datetime.now(timezone.utc).astimezone()
+LOOKBACK_DAYS = 4  # Monday still sees Friday's log
 
-    for offset in range(2):
+
+def get_recent_log(daily_dir: Path = DAILY_DIR, today: datetime | None = None,
+                   lookback_days: int = LOOKBACK_DAYS) -> str:
+    """Read the most recent daily log within the last `lookback_days` days."""
+    today = today or datetime.now(timezone.utc).astimezone()
+
+    for offset in range(lookback_days):
         date = today - timedelta(days=offset)
-        log_path = DAILY_DIR / f"{date.strftime('%Y-%m-%d')}.md"
+        log_path = daily_dir / f"{date.strftime('%Y-%m-%d')}.md"
         if log_path.exists():
-            lines = log_path.read_text(encoding="utf-8").splitlines()
-            # Return last N lines to keep context small
-            recent = lines[-MAX_LOG_LINES:] if len(lines) > MAX_LOG_LINES else lines
-            return "\n".join(recent)
+            return log_path.read_text(encoding="utf-8")
 
     return "(no recent daily log)"
 
 
-def build_context() -> str:
-    """Assemble the context to inject into the conversation."""
-    parts = []
+def compact_kb_index(index_md: str, budget: int = KB_INDEX_BUDGET) -> str:
+    """Turn the padded index table into `- [[slug]] — summary (date)` lines,
+    newest first, cut to `budget` characters.
 
-    # Today's date
-    today = datetime.now(timezone.utc).astimezone()
-    parts.append(f"## Today\n{today.strftime('%A, %B %d, %Y')}")
+    The full table is ~240 KB; a compact, recency-ordered excerpt is what fits
+    into a session. The header tells the model the full index exists on disk.
+    """
+    rows = []
+    for line in index_md.splitlines():
+        m = _ROW_RE.match(line)
+        if not m:
+            continue
+        slug, summary, _sources, updated = m.groups()
+        if slug.lower() == "article":
+            continue
+        rows.append((slug, summary, updated))
+
+    rows.sort(key=lambda r: r[2], reverse=True)
+
+    header = (
+        f"{len(rows)} articles total; newest first, full table in knowledge/index.md "
+        "(Grep it or Read an article for details).\n"
+    )
+    out = [header]
+    size = len(header)
+    for slug, summary, updated in rows:
+        if len(summary) > SUMMARY_MAX_CHARS:
+            summary = summary[: SUMMARY_MAX_CHARS - 1].rstrip() + "…"
+        entry = f"- [[{slug}]] — {summary} ({updated})"
+        if size + len(entry) + 1 > budget:
+            break
+        out.append(entry)
+        size += len(entry) + 1
+    return "\n".join(out)
+
+
+def _truncate_head(text: str, budget: int) -> str:
+    if len(text) <= budget:
+        return text
+    return text[:budget].rsplit("\n", 1)[0] + "\n\n...(truncated)"
+
+
+def _tail_lines(text: str, max_lines: int, budget: int) -> str:
+    lines = text.splitlines()
+    recent = lines[-max_lines:] if len(lines) > max_lines else lines
+    out = "\n".join(recent)
+    if len(out) > budget:
+        out = out[-budget:]
+        boundary = out.find("\n")
+        if boundary > 0:
+            out = out[boundary + 1:]
+    return out
+
+
+def build_context(
+    *,
+    wiki_index: str | None,
+    kb_index: str | None,
+    recent_log: str,
+    today: datetime | None = None,
+) -> str:
+    """Assemble the context to inject into the conversation."""
+    today = today or datetime.now(timezone.utc).astimezone()
+    parts = [f"## Today\n{today.strftime('%A, %B %d, %Y')}"]
 
     # Wiki index (domain knowledge — what things are)
-    if WIKI_INDEX_FILE.exists():
-        wiki_content = WIKI_INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Wiki Index (Domain Knowledge)\n\n{wiki_content}")
+    if wiki_index:
+        parts.append(
+            "## Wiki Index (Domain Knowledge)\n\n" + _truncate_head(wiki_index, WIKI_INDEX_BUDGET)
+        )
 
     # Knowledge base index (engineering lessons — what was learned)
-    if INDEX_FILE.exists():
-        index_content = INDEX_FILE.read_text(encoding="utf-8")
-        parts.append(f"## Knowledge Base Index (Engineering Lessons)\n\n{index_content}")
+    if kb_index:
+        parts.append(
+            "## Knowledge Base Index (Engineering Lessons)\n\n"
+            + compact_kb_index(kb_index, KB_INDEX_BUDGET)
+        )
     else:
         parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
 
     # Recent daily log
-    recent_log = get_recent_log()
-    parts.append(f"## Recent Daily Log\n\n{recent_log}")
+    parts.append(
+        "## Recent Daily Log\n\n" + _tail_lines(recent_log, MAX_LOG_LINES, DAILY_LOG_BUDGET)
+    )
 
     context = "\n\n---\n\n".join(parts)
-
-    # Truncate if too long
-    if len(context) > MAX_CONTEXT_CHARS:
+    if len(context) > MAX_CONTEXT_CHARS:  # defensive; budgets above make this unreachable
         context = context[:MAX_CONTEXT_CHARS] + "\n\n...(truncated)"
-
     return context
 
 
 def main():
-    context = build_context()
+    wiki_index = WIKI_INDEX_FILE.read_text(encoding="utf-8") if WIKI_INDEX_FILE.exists() else None
+    kb_index = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else None
+
+    context = build_context(
+        wiki_index=wiki_index,
+        kb_index=kb_index,
+        recent_log=get_recent_log(),
+    )
 
     output = {
         "hookSpecificOutput": {

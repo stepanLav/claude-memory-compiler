@@ -325,6 +325,13 @@ llm-personal-kb/
 
 Hooks are configured in `.claude/settings.json` and fire automatically when you use Claude Code in this project.
 
+**Register each hook in exactly one settings file.** If the same hook is present in both
+`~/.claude/settings.json` (global) and a project's `.claude/settings.json`, Claude Code runs it
+twice per event. Two `flush.py` processes then start in the same second; the atomic session lock
+in `flush.py` makes the second one exit, but the hook work and transcript parsing are still doubled.
+In this installation the hooks live in the global file (with absolute paths) so every project
+is captured, and the project file was removed.
+
 ### `.claude/settings.json` Format
 
 ```json
@@ -343,14 +350,15 @@ Commands use simple relative paths from the project root. Empty `matcher` catche
 
 **`session-start.py`** (SessionStart)
 - Pure local I/O, no API calls, runs in under 1 second
-- Reads `knowledge/index.md` and the most recent daily log
+- Reads the domain wiki index (`../wiki/index.md`), `knowledge/index.md` and the most recent daily log (up to 4 days back, so Monday sees Friday)
 - Outputs JSON to stdout: `{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "..."}}`
-- Claude sees the knowledge base index at the start of every session
-- Max context: 20,000 characters
+- Claude sees both indexes and the latest log at the start of every session
+- Per-section budgets: wiki index 20k chars, knowledge index 12k chars (compact `- [[slug]] — summary (date)` lines, newest first), daily log 5k chars. A single shared cap used to let the wiki index crowd out everything else.
 
 **`session-end.py`** (SessionEnd)
-- Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `cwd`)
-- Copies the raw JSONL transcript to a temp file (no parsing in the hook - keeps it fast)
+- Reads hook input from stdin (JSON with `session_id`, `transcript_path`, `reason`, `cwd`)
+- Extracts the last 30 user/assistant text turns (max 15k chars) into a temp `.md` file
+- Skips sessions with fewer than 6 turns (`MIN_TURNS_TO_FLUSH`) - a one-question session is never worth an LLM call
 - Spawns `flush.py` as a fully detached background process
 - Recursion guard: exits immediately if `CLAUDE_INVOKED_BY` env var is set
 
@@ -373,12 +381,24 @@ This ensures flush.py survives after Claude Code's hook process exits.
 **What flush.py does:**
 1. Sets `CLAUDE_INVOKED_BY=memory_flush` env var (prevents recursive hook firing)
 2. Reads the pre-extracted conversation context from the temp `.md` file
-3. Skips if context is empty or if same session was flushed within 60 seconds (deduplication)
-4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`)
+3. Takes an atomic per-session lock (`scripts/session-lock-<id>`, O_EXCL create, 60 s window). The loser of the race exits - this is what de-duplicates double-registered hooks. A PreCompact flush followed later by a SessionEnd flush still both run.
+4. Calls Claude Agent SDK (`query()` with `allowed_tools=[]`, `max_turns=2`, `model=FLUSH_MODEL`, `fallback_model=FALLBACK_MODEL` from `config.py`). The CLI's stderr is captured into `flush.log`; API errors the CLI reports as text are written into the `FLUSH_ERROR` entry so the daily log says *why*.
 5. Claude decides what's worth saving - returns structured bullet points or `FLUSH_OK`
 6. Appends result to `daily/YYYY-MM-DD.md`
 7. Cleans up temp context file
-8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger.
+8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger. `compile.py` holds `scripts/compile.lock` while it runs, so two triggers cannot compile concurrently.
+
+### Model pinning (`scripts/config.py`)
+
+The Agent SDK ships its **own** Claude Code binary (`claude_agent_sdk/_bundled/claude`) and always
+prefers it over the `claude` on `PATH`. That binary reads `model` from `~/.claude/settings.json`. When the
+interactive model is newer than the bundled binary supports, every SDK call fails with
+`Command failed with exit code 1` (the API returns `400 claude_code_version_too_old`, or the CLI prints
+"There's an issue with the selected model"). This took the pipeline down for Sep 21-23 and Oct 8-15, 2026.
+
+Every script therefore passes `model=` and `fallback_model=` explicitly (`FLUSH_MODEL`, `COMPILE_MODEL`,
+`FALLBACK_MODEL`). Keep the SDK current (`uv lock --upgrade-package claude-agent-sdk && uv sync`) so the
+bundled binary knows the pinned aliases.
 
 ### JSONL Transcript Format
 
@@ -483,7 +503,8 @@ Both are gitignored and regenerated automatically.
 ## Dependencies
 
 `pyproject.toml` (at project root):
-- `claude-agent-sdk>=0.1.29` - Claude Agent SDK for LLM calls with tool use
+- `claude-agent-sdk>=0.1.29` - Claude Agent SDK for LLM calls with tool use (locked at 0.2.168; bundles Claude Code 2.1.301)
+- `pytest` (dev) - unit tests under `tests/`: `uv run python -m pytest -q`
 - `python-dotenv>=1.0.0` - Environment variable management
 - `tzdata>=2024.1` - Timezone data
 - Python 3.12+, managed by [uv](https://docs.astral.sh/uv/)
@@ -494,14 +515,20 @@ No API key needed - uses Claude Code's built-in credentials at `~/.claude/.crede
 
 ## Costs
 
+Figures are the API-equivalent cost the SDK reports; on a Claude subscription they count against
+usage limits rather than a bill.
+
 | Operation | Cost |
 |-----------|------|
-| Compile one daily log | $0.45-0.65 |
-| Query (no file-back) | ~$0.15-0.25 |
-| Query (with file-back) | ~$0.25-0.40 |
-| Full lint (with contradictions) | ~$0.15-0.25 |
+| Compile one daily log | $0.5-2 with the index-only prompt (was $8-18 when every article body was inlined: ~880k input tokens per call at 433 articles, which is also where it stopped working) |
+| Query (no file-back) | ~$0.15-0.40 |
+| Query (with file-back) | ~$0.25-0.60 |
+| Full lint (with contradictions) | ~$1-3 (agent reads article clusters on demand) |
 | Structural lint only | $0.00 |
-| Memory flush (per session) | ~$0.02-0.05 |
+| Memory flush (per session) | ~$0.02-0.10 |
+
+**Scaling rule:** prompts must carry the *index*, never the article bodies. The agent has Read/Glob/Grep;
+anything that calls `read_all_wiki_content()` will stop working once the knowledge base passes a few hundred articles.
 
 ---
 

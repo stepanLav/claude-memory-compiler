@@ -2,10 +2,13 @@
 
 import hashlib
 import json
+import os
 import re
+import time
 from pathlib import Path
 
 from config import (
+    COMPILE_LOCK_STALE_SECONDS,
     CONCEPTS_DIR,
     CONNECTIONS_DIR,
     DAILY_DIR,
@@ -13,8 +16,80 @@ from config import (
     KNOWLEDGE_DIR,
     LOG_FILE,
     QA_DIR,
+    SESSION_LOCK_WINDOW_SECONDS,
     STATE_FILE,
 )
+
+
+# ── Locks ─────────────────────────────────────────────────────────────
+#
+# Both helpers rely on O_EXCL file creation, which is atomic on every
+# platform we run on. A plain "read state, compare, write state" check
+# cannot de-duplicate two processes that start in the same second.
+
+def _try_create_exclusive(path: Path) -> bool:
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
+    return True
+
+
+def _is_older_than(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime > seconds
+    except OSError:
+        return True  # vanished between checks - treat as expired
+
+
+def acquire_session_lock(session_id: str, state_dir: Path,
+                         window: float = SESSION_LOCK_WINDOW_SECONDS) -> bool:
+    """Return True for the first flush of `session_id` inside `window` seconds.
+
+    A second caller inside the window (e.g. the same hook registered twice)
+    gets False and should skip. After the window expires the lock is reclaimed,
+    so a PreCompact flush followed later by a SessionEnd flush still both run.
+    """
+    lock = Path(state_dir) / f"session-lock-{session_id}"
+    if _try_create_exclusive(lock):
+        return True
+    if _is_older_than(lock, window):
+        lock.unlink(missing_ok=True)
+        return _try_create_exclusive(lock)
+    return False
+
+
+def acquire_compile_lock(lock_path: Path,
+                         stale_seconds: float = COMPILE_LOCK_STALE_SECONDS) -> bool:
+    """Exclusive lock for compile.py. Reclaims locks left by crashed runs."""
+    lock = Path(lock_path)
+    if _try_create_exclusive(lock):
+        return True
+    if _is_older_than(lock, stale_seconds):
+        lock.unlink(missing_ok=True)
+        return _try_create_exclusive(lock)
+    return False
+
+
+def release_compile_lock(lock_path: Path) -> None:
+    Path(lock_path).unlink(missing_ok=True)
+
+
+def compact_table_whitespace(markdown_table: str) -> str:
+    """Collapse the column padding Obsidian adds to markdown tables.
+
+    The knowledge index is ~240 KB on disk but most of it is spaces and
+    dashes used to align columns; collapsing them cuts the prompt by ~4x
+    without losing any information.
+    """
+    lines = []
+    for line in markdown_table.splitlines():
+        line = re.sub(r"-{3,}", "---", line)
+        line = re.sub(r" {2,}", " ", line)
+        lines.append(line.rstrip())
+    return "\n".join(lines)
 
 
 # ── State management ──────────────────────────────────────────────────

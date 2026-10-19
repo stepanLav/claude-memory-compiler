@@ -41,7 +41,12 @@ uv run python scripts/query.py "question"            # ask the knowledge base
 uv run python scripts/query.py "question" --file-back # ask + save answer back
 uv run python scripts/lint.py                        # run health checks
 uv run python scripts/lint.py --structural-only      # free structural checks only
+uv run python -m pytest -q                           # unit tests for hooks and scripts
 ```
+
+Models are pinned in `scripts/config.py` (`FLUSH_MODEL`, `COMPILE_MODEL`, `FALLBACK_MODEL`) so the
+background jobs never depend on the model you picked interactively. Keep the SDK current with
+`uv lock --upgrade-package claude-agent-sdk && uv sync` - it bundles its own Claude Code binary.
 
 ## Why No RAG?
 
