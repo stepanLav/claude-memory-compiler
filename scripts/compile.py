@@ -20,6 +20,7 @@ from pathlib import Path
 
 from config import (
     AGENTS_FILE,
+    AUTO_SYNC_DATA_REPO,
     COMPILE_LOCK_FILE,
     COMPILE_MODEL,
     CONCEPTS_DIR,
@@ -328,6 +329,13 @@ def main():
                 print(line)
     except Exception as e:
         print(f"Post-compile lint skipped: {e}")
+
+    # Back up the knowledge data repo (daily/ + knowledge/) if it is a separate
+    # git repo. Failures are reported, never raised.
+    if AUTO_SYNC_DATA_REPO:
+        from datasync import sync_data_repo
+
+        print(f"Data repo sync: {sync_data_repo(KNOWLEDGE_DIR, forbidden_root=ROOT_DIR)}")
 
 
 if __name__ == "__main__":

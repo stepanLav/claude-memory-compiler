@@ -44,6 +44,10 @@ uv run python scripts/lint.py --structural-only      # free structural checks on
 uv run python -m pytest -q                           # unit tests for hooks and scripts
 ```
 
+If `daily/` and `knowledge/` are symlinks into a separate private git repo, `compile.py` commits
+and pushes that repo after every run (`AUTO_SYNC_DATA_REPO` in `scripts/config.py`), so the
+knowledge base is backed up while this public repo stays code-only.
+
 Models are pinned in `scripts/config.py` (`FLUSH_MODEL`, `COMPILE_MODEL`, `FALLBACK_MODEL`) so the
 background jobs never depend on the model you picked interactively. Keep the SDK current with
 `uv lock --upgrade-package claude-agent-sdk && uv sync` - it bundles its own Claude Code binary.

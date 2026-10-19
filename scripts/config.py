@@ -33,6 +33,12 @@ FALLBACK_MODEL = "sonnet"   # used by the CLI when the primary is overloaded
 SESSION_LOCK_WINDOW_SECONDS = 60     # same session flushed twice inside this window = duplicate
 COMPILE_LOCK_STALE_SECONDS = 2 * 3600  # a compile lock older than this is treated as abandoned
 
+# ── Data repo sync ─────────────────────────────────────────────────────
+# After a compile, commit + push the git repo that owns knowledge/ (and daily/),
+# if that is a separate repo reached through symlinks. Never syncs the compiler
+# checkout itself - see scripts/datasync.py.
+AUTO_SYNC_DATA_REPO = True
+
 
 def now_iso() -> str:
     """Current time in ISO 8601 format."""

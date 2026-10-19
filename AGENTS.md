@@ -388,6 +388,15 @@ This ensures flush.py survives after Claude Code's hook process exits.
 7. Cleans up temp context file
 8. **End-of-day auto-compilation:** If it's past 6 PM local time (`COMPILE_AFTER_HOUR = 18`) and today's daily log has changed since its last compilation (hash comparison against `state.json`), spawns `compile.py` as another detached background process. This means compilation happens automatically once a day without needing a cron job or manual trigger. `compile.py` holds `scripts/compile.lock` while it runs, so two triggers cannot compile concurrently.
 
+### Data repo sync (`scripts/datasync.py`)
+
+`daily/` and `knowledge/` are gitignored here because this repo is public. They can live in a
+separate private repo reached through symlinks (`daily -> ../.claude-memory-data/daily`). When
+`AUTO_SYNC_DATA_REPO` is on, `compile.py` ends by committing and pushing that repo
+(`kb: compile <date>`). The sync resolves the symlink, asks git for the toplevel, and refuses to
+touch a repo whose toplevel is this compiler checkout, so a plain-directory install can never have
+its code tree pushed by accident. Push failures are printed to `compile.log`, not raised.
+
 ### Model pinning (`scripts/config.py`)
 
 The Agent SDK ships its **own** Claude Code binary (`claude_agent_sdk/_bundled/claude`) and always
