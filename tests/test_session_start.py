@@ -32,17 +32,22 @@ def test_compact_kb_index_keeps_most_recent_entries_within_budget():
     assert "433 articles" in out  # tells the model the full index exists
 
 
-def test_build_context_always_includes_every_section():
-    wiki_index = "# Wiki Index\n" + ("- [[page]] — long summary text here\n" * 600)  # ~20k chars
-    kb_index = make_kb_index(433)
-    daily = "# Daily Log: 2026-10-19\n\n### Session (10:00)\n\n**Context:** fixing the compiler\n"
-    ctx = ss.build_context(wiki_index=wiki_index, kb_index=kb_index, recent_log=daily)
-    assert "## Wiki Index" in ctx
-    assert "## Knowledge Base Index" in ctx
-    assert "## Recent Daily Log" in ctx
-    assert "fixing the compiler" in ctx
+def test_build_context_fits_under_claude_code_cap_with_every_section():
+    kb_index = make_kb_index(600)
+    daily = "# Daily Log: 2026-10-19\n\n### Session (10:00)\n\n**Context:** fixing the compiler\n" + ("- detail line of the log\n" * 2000)
+    ctx = ss.build_context(kb_index=kb_index, recent_log=daily + "\nlast line marker\n", wiki_count=130)
+    # Claude Code replaces anything over 10k chars with a 2k preview.
+    assert len(ctx) <= ss.MAX_CONTEXT_CHARS < ss.HARD_LIMIT
+    assert "qmd query" in ctx
+    assert "600 articles" in ctx and "130 pages" in ctx
+    assert "## Newest knowledge base articles" in ctx
     assert "- [[concepts/article-" in ctx
-    assert len(ctx) <= ss.MAX_CONTEXT_CHARS
+    assert "last line marker" in ctx  # the tail of the log, not its head
+
+
+def test_build_context_without_knowledge_base():
+    ctx = ss.build_context(kb_index=None, recent_log="(no recent daily log)")
+    assert "qmd query" in ctx and "Newest knowledge base" not in ctx
 
 
 def test_recent_log_looks_back_over_a_weekend(tmp_path):

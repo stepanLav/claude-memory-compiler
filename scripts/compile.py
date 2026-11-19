@@ -19,6 +19,8 @@ import sys
 from pathlib import Path
 
 from config import (
+    AGENT_EXTRA_ARGS,
+    AGENT_SETTING_SOURCES,
     AGENTS_FILE,
     AUTO_SYNC_DATA_REPO,
     COMPILE_LOCK_FILE,
@@ -31,6 +33,7 @@ from config import (
     now_iso,
 )
 from utils import (
+    refresh_search_index,
     acquire_compile_lock,
     compact_table_whitespace,
     file_hash,
@@ -208,6 +211,8 @@ async def compile_daily_log(log_path: Path, state: dict) -> float:
                 max_turns=30,
                 model=COMPILE_MODEL,
                 fallback_model=FALLBACK_MODEL,
+                setting_sources=AGENT_SETTING_SOURCES,
+                extra_args=AGENT_EXTRA_ARGS,
                 stderr=lambda line: stderr_lines.append(line.rstrip()),
             ),
         ):
@@ -336,6 +341,7 @@ def main():
         from datasync import sync_data_repo
 
         print(f"Data repo sync: {sync_data_repo(KNOWLEDGE_DIR, forbidden_root=ROOT_DIR)}")
+        refresh_search_index(embed=True)
 
 
 if __name__ == "__main__":

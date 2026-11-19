@@ -6,7 +6,10 @@ pre-extracted conversation context from a .md file, uses the Claude Agent SDK
 to decide what's worth saving, and appends the result to today's daily log.
 
 Usage:
-    uv run python flush.py <context_file.md> <session_id>
+    uv run python flush.py <context_file.md> <session_id> [end_offset]
+
+`end_offset` is the transcript byte offset this context ends at. It is saved
+only after a successful flush, so a failed flush is retried by the next hook.
 """
 
 from __future__ import annotations
@@ -24,14 +27,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from config import (
+    AGENT_EXTRA_ARGS,
+    AGENT_SETTING_SOURCES,
     COMPILE_LOCK_FILE,
     COMPILE_LOCK_STALE_SECONDS,
     FALLBACK_MODEL,
+    FLUSH_CHUNK_CHARS,
     FLUSH_MODEL,
 )
+from transcript import OFFSET_PREFIX, split_into_chunks, write_offset
 from utils import (  # noqa: F401  (re-exported for tests and callers)
     acquire_compile_lock,
     acquire_session_lock,
+    refresh_search_index,
     release_compile_lock,
 )
 
@@ -70,21 +78,7 @@ def append_to_daily_log(content: str, section: str = "Session") -> None:
         f.write(entry)
 
 
-async def run_flush(context: str) -> str:
-    """Use Claude Agent SDK to extract important knowledge from conversation context."""
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
-        query,
-    )
-
-    prompt = f"""Review the conversation context below and respond with a concise summary
-of important items that should be preserved in the daily log.
-Do NOT use any tools — just return plain text.
-
-Format your response as a structured daily log entry with these sections:
+ENTRY_FORMAT = """Format your response as a structured daily log entry with these sections:
 
 **Context:** [One line about what the user was working on]
 
@@ -106,15 +100,61 @@ Skip anything that is:
 - Trivial back-and-forth or clarification exchanges
 
 Only include sections that have actual content. If nothing is worth saving,
-respond with exactly: FLUSH_OK
+respond with exactly: FLUSH_OK"""
 
-## Conversation Context
+
+def build_single_prompt(context: str) -> str:
+    return f"""Review the conversation below and respond with a concise summary
+of important items that should be preserved in the daily log.
+Lines like `[tool: Name — detail]` mark tool calls the assistant made.
+Do NOT use any tools — just return plain text.
+
+{ENTRY_FORMAT}
+
+## Conversation
 
 {context}"""
 
+
+def build_chunk_prompt(chunk: str, index: int, total: int) -> str:
+    return f"""This is part {index} of {total} of one long conversation. Extract working
+notes that a later step will merge into a daily log entry: what the user was
+doing, decisions and their rationale, lessons and gotchas, concrete facts
+(names, numbers, paths, IDs), and follow-ups. Keep specifics; drop routine
+tool calls and small talk. Lines like `[tool: Name — detail]` mark tool calls.
+Do NOT use any tools — just return plain text. If this part has nothing worth
+keeping, respond with exactly: NOTHING
+
+## Conversation part {index}/{total}
+
+{chunk}"""
+
+
+def build_merge_prompt(notes: list[str]) -> str:
+    joined = "\n\n".join(f"### Notes from part {i}\n\n{n}" for i, n in enumerate(notes, 1))
+    return f"""Below are working notes extracted from consecutive parts of one
+conversation. Merge them into a single daily log entry. Later parts win where
+they revise earlier ones (a decision changed, a fix replaced). Do not invent
+anything that is not in the notes.
+Do NOT use any tools — just return plain text.
+
+{ENTRY_FORMAT}
+
+## Notes
+
+{joined}"""
+
+
+class FlushError(Exception):
+    pass
+
+
+async def ask(prompt: str) -> str:
+    """One isolated, tool-less model call. Raises FlushError on failure."""
+    from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+
     response = ""
     stderr_lines: list[str] = []
-
     try:
         async for message in query(
             prompt=prompt,
@@ -124,6 +164,8 @@ respond with exactly: FLUSH_OK
                 max_turns=2,
                 model=FLUSH_MODEL,
                 fallback_model=FALLBACK_MODEL,
+                setting_sources=AGENT_SETTING_SOURCES,
+                extra_args=AGENT_EXTRA_ARGS,
                 stderr=lambda line: stderr_lines.append(line.rstrip()),
             ),
         ):
@@ -131,8 +173,6 @@ respond with exactly: FLUSH_OK
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         response += block.text
-            elif isinstance(message, ResultMessage):
-                pass
     except Exception as e:
         import traceback
         logging.error("Agent SDK error: %s\n%s", e, traceback.format_exc())
@@ -142,11 +182,35 @@ respond with exactly: FLUSH_OK
         # The CLI reports API failures as assistant text, so if we got any
         # text back it is the most useful thing to record.
         detail = response.strip() or (stderr_lines[-1] if stderr_lines else "")
-        response = f"FLUSH_ERROR: {type(e).__name__}: {e}"
+        message = f"{type(e).__name__}: {e}"
         if detail:
-            response += f"\nDetail: {detail[:500]}"
-
+            message += f"\nDetail: {detail[:500]}"
+        raise FlushError(message) from e
+    if not response.strip():
+        raise FlushError("empty response from the model")
     return response
+
+
+async def run_flush(context: str, chunk_chars: int = FLUSH_CHUNK_CHARS, ask_fn=ask) -> str:
+    """Summarize the whole conversation: one call if it fits, map + merge if not."""
+    chunks = split_into_chunks(context, chunk_chars)
+    try:
+        if len(chunks) <= 1:
+            return await ask_fn(build_single_prompt(chunks[0] if chunks else context))
+
+        logging.info("Long session: %d chunks", len(chunks))
+        notes = []
+        for i, chunk in enumerate(chunks, 1):
+            note = (await ask_fn(build_chunk_prompt(chunk, i, len(chunks)))).strip()
+            if note and note != "NOTHING":
+                notes.append(note)
+        if not notes:
+            return "FLUSH_OK"
+        if len(notes) == 1 and len(chunks) == 1:
+            return notes[0]
+        return await ask_fn(build_merge_prompt(notes))
+    except FlushError as e:
+        return f"FLUSH_ERROR: {e}"
 
 
 COMPILE_AFTER_HOUR = 18  # 6 PM local time
@@ -156,11 +220,15 @@ def cleanup_stale_context_files(max_age_days: int = 7) -> None:
     """Remove context files and session locks left behind by flush runs that
     died before their own cleanup (crash, kill, power loss)."""
     cutoff = time.time() - max_age_days * 86400
-    patterns = ("session-flush-*.md", "flush-context-*.md", "session-lock-*")
+    # Offsets live longer: a session resumed after a week must not be
+    # re-summarized from its first turn.
+    offset_cutoff = time.time() - 60 * 86400
+    patterns = ("session-flush-*.md", "flush-context-*.md", "session-lock-*", f"{OFFSET_PREFIX}*")
     for pattern in patterns:
         for stale in SCRIPTS_DIR.glob(pattern):
             try:
-                if stale.stat().st_mtime < cutoff:
+                limit = offset_cutoff if pattern.startswith(OFFSET_PREFIX) else cutoff
+                if stale.stat().st_mtime < limit:
                     stale.unlink()
                     logging.info("Removed stale file: %s", stale.name)
             except OSError:
@@ -231,6 +299,7 @@ def main():
 
     context_file = Path(sys.argv[1])
     session_id = sys.argv[2]
+    end_offset = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else None
 
     logging.info("flush.py started for session %s, context: %s", session_id, context_file)
 
@@ -258,14 +327,18 @@ def main():
     response = asyncio.run(run_flush(context))
 
     # Append to daily log
-    if "FLUSH_OK" in response:
+    failed = response.startswith("FLUSH_ERROR")
+    if not failed and end_offset is not None:
+        write_offset(SCRIPTS_DIR, session_id, end_offset)
+
+    if failed:
+        logging.error("Result: %s", response)
+        append_to_daily_log(response, "Memory Flush")
+    elif response.strip() == "FLUSH_OK":
         logging.info("Result: FLUSH_OK")
         append_to_daily_log(
             "FLUSH_OK - Nothing worth saving from this session", "Memory Flush"
         )
-    elif "FLUSH_ERROR" in response:
-        logging.error("Result: %s", response)
-        append_to_daily_log(response, "Memory Flush")
     else:
         logging.info("Result: saved to daily log (%d chars)", len(response))
         append_to_daily_log(response, "Session")
@@ -275,6 +348,9 @@ def main():
 
     # Sweep leftovers from flush runs that never reached their own cleanup
     cleanup_stale_context_files()
+
+    # Make the new daily entry searchable (keyword index; embeddings follow the compile)
+    refresh_search_index()
 
     # End-of-day auto-compilation: if it's past the compile hour and today's
     # log hasn't been compiled yet, trigger compile.py in the background.

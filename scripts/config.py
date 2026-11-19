@@ -29,6 +29,24 @@ FLUSH_MODEL = "opus"        # judges what is worth keeping; sonnet returned FLUS
 COMPILE_MODEL = "opus"      # multi-step article writing with tools
 FALLBACK_MODEL = "sonnet"   # used by the CLI when the primary is overloaded
 
+# ── Agent isolation ────────────────────────────────────────────────────
+# Flush/compile/lint/query agents must not load the interactive setup: with the
+# SDK default (user + project settings) every flush received the SessionStart
+# injection twice plus the full skill listing - ~31k tokens of context around a
+# ~4k-token payload - and left a transcript in ~/.claude/projects per call.
+AGENT_SETTING_SOURCES: list[str] = []
+AGENT_EXTRA_ARGS: dict[str, str | None] = {"no-session-persistence": None}
+
+# ── Flush sizing ───────────────────────────────────────────────────────
+# A session is summarized whole. Up to this many characters go in one call;
+# longer sessions are summarized chunk by chunk and then merged.
+FLUSH_CHUNK_CHARS = 120_000
+
+# ── Search index ───────────────────────────────────────────────────────
+# qmd (https://github.com/tobi/qmd) indexes wiki/, knowledge/ and daily/.
+# Refreshed after each flush (keyword index) and each compile (+ embeddings).
+QMD_BIN = "qmd"
+
 # ── Concurrency ────────────────────────────────────────────────────────
 SESSION_LOCK_WINDOW_SECONDS = 60     # same session flushed twice inside this window = duplicate
 COMPILE_LOCK_STALE_SECONDS = 2 * 3600  # a compile lock older than this is treated as abandoned

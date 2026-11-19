@@ -15,7 +15,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
+from config import AGENT_EXTRA_ARGS, AGENT_SETTING_SOURCES, COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, REPORTS_DIR, now_iso, today_iso
 from utils import (
     count_inbound_links,
     extract_wikilinks,
@@ -194,6 +194,8 @@ Do NOT output anything else - no preamble, no explanation, just the formatted li
                 max_turns=25,
                 model=COMPILE_MODEL,
                 fallback_model=FALLBACK_MODEL,
+                setting_sources=AGENT_SETTING_SOURCES,
+                extra_args=AGENT_EXTRA_ARGS,
             ),
         ):
             if isinstance(message, AssistantMessage):

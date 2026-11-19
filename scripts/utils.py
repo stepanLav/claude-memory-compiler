@@ -16,6 +16,7 @@ from config import (
     KNOWLEDGE_DIR,
     LOG_FILE,
     QA_DIR,
+    QMD_BIN,
     SESSION_LOCK_WINDOW_SECONDS,
     STATE_FILE,
 )
@@ -75,6 +76,24 @@ def acquire_compile_lock(lock_path: Path,
 
 def release_compile_lock(lock_path: Path) -> None:
     Path(lock_path).unlink(missing_ok=True)
+
+
+# ── Search index ──────────────────────────────────────────────────────
+
+def refresh_search_index(embed: bool = False) -> None:
+    """Re-index markdown for qmd in the background. Missing qmd is not an error."""
+    import shutil
+    import subprocess as _sp
+
+    qmd = shutil.which(QMD_BIN)
+    if not qmd:
+        return
+    script = f'"{qmd}" update' + (f' && "{qmd}" embed' if embed else "")
+    try:
+        _sp.Popen(["sh", "-c", script], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                  start_new_session=True)
+    except OSError:
+        pass  # search stays stale until the next refresh; never fail a flush over it
 
 
 def compact_table_whitespace(markdown_table: str) -> str:

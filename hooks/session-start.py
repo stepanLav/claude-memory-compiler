@@ -1,66 +1,66 @@
 """
-SessionStart hook - injects knowledge base context into every conversation.
+SessionStart hook - tells the session what memory exists and how to reach it.
 
-This is the "context injection" layer. When Claude Code starts a session,
-this hook reads both knowledge bases (wiki + compiled knowledge) and the
-recent daily log, then injects them as additional context so Claude always
-"remembers" what it has learned.
+Claude Code caps a hook's additionalContext at 10,000 characters; anything
+longer is written to a file and the model sees a 2,000-character preview. The
+previous version injected ~36 KB of indexes, so sessions effectively received
+eight lines of the wiki index and nothing else.
 
-Each section gets its own character budget so a large wiki index can never
-crowd out the knowledge base index or the daily log (which is what happened
-when a single 20k cap was applied to the concatenation).
+So this hook injects a short briefing instead of the indexes: where the
+knowledge lives, how to search it (qmd), the newest article titles, and the
+tail of the latest daily log. Details are pulled on demand.
 """
 
 import json
+import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# Paths relative to project root (claude-memory-compiler/)
 ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE_DIR = ROOT / "knowledge"
 DAILY_DIR = ROOT / "daily"
 INDEX_FILE = KNOWLEDGE_DIR / "index.md"
-
-# Wiki lives one level up in the parent project (claude-power/)
 PROJECT_ROOT = ROOT.parent
-WIKI_INDEX_FILE = PROJECT_ROOT / "wiki" / "index.md"
+WIKI_DIR = PROJECT_ROOT / "wiki"
 
-# Per-section budgets (characters). ~4 chars per token.
-WIKI_INDEX_BUDGET = 20_000
-KB_INDEX_BUDGET = 12_000
-DAILY_LOG_BUDGET = 5_000
-MAX_CONTEXT_CHARS = WIKI_INDEX_BUDGET + KB_INDEX_BUDGET + DAILY_LOG_BUDGET + 2_000
-MAX_LOG_LINES = 40
+HARD_LIMIT = 10_000          # Claude Code's cap per additionalContext string
+MAX_CONTEXT_CHARS = 9_000    # stay clear of it
+RECENT_ARTICLES_BUDGET = 2_600
+DAILY_LOG_BUDGET = 4_500
+MAX_LOG_LINES = 45
 SUMMARY_MAX_CHARS = 110
+LOOKBACK_DAYS = 4  # Monday still sees Friday's log
 
 _ROW_RE = re.compile(r"^\|\s*\[\[([^\]]+)\]\]\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(\S+)\s*\|\s*$")
 
+HOW_TO_SEARCH = """## Memory: what exists and how to reach it
 
-LOOKBACK_DAYS = 4  # Monday still sees Friday's log
+The user keeps two knowledge bases in {project_root}. They are NOT loaded into this session - search them when the task could have history:
+
+- **Engineering knowledge base** ({kb_count} articles compiled from past sessions: bugs, root causes, review findings, decisions, how earlier tasks were done). Collection `knowledge`.
+- **Domain wiki** ({wiki_count} pages: concepts, products, people, analyses, meeting notes with action items). Collection `wiki`.
+- **Daily session logs** (what was done and decided, day by day). Collection `daily`.
+
+Search with the `qmd` MCP tools (`query`, then `get`) or the CLI: `qmd query "<question in English>" -n 8`, `qmd search "<exact term, ticket id, PR number>"`, `qmd get <path>`. Articles are written in English - query in English.
+
+Search before: debugging something that may have happened before, reviewing or changing an area worked on earlier, answering "how did we / why did we", continuing a task from a previous session. Skip it for self-contained tasks."""
 
 
 def get_recent_log(daily_dir: Path = DAILY_DIR, today: datetime | None = None,
                    lookback_days: int = LOOKBACK_DAYS) -> str:
     """Read the most recent daily log within the last `lookback_days` days."""
     today = today or datetime.now(timezone.utc).astimezone()
-
     for offset in range(lookback_days):
         date = today - timedelta(days=offset)
         log_path = daily_dir / f"{date.strftime('%Y-%m-%d')}.md"
         if log_path.exists():
-            return log_path.read_text(encoding="utf-8")
-
+            return f"({log_path.name})\n" + log_path.read_text(encoding="utf-8")
     return "(no recent daily log)"
 
 
-def compact_kb_index(index_md: str, budget: int = KB_INDEX_BUDGET) -> str:
-    """Turn the padded index table into `- [[slug]] — summary (date)` lines,
-    newest first, cut to `budget` characters.
-
-    The full table is ~240 KB; a compact, recency-ordered excerpt is what fits
-    into a session. The header tells the model the full index exists on disk.
-    """
+def parse_kb_rows(index_md: str) -> list[tuple[str, str, str]]:
     rows = []
     for line in index_md.splitlines():
         m = _ROW_RE.match(line)
@@ -70,13 +70,14 @@ def compact_kb_index(index_md: str, budget: int = KB_INDEX_BUDGET) -> str:
         if slug.lower() == "article":
             continue
         rows.append((slug, summary, updated))
-
     rows.sort(key=lambda r: r[2], reverse=True)
+    return rows
 
-    header = (
-        f"{len(rows)} articles total; newest first, full table in knowledge/index.md "
-        "(Grep it or Read an article for details).\n"
-    )
+
+def compact_kb_index(index_md: str, budget: int = RECENT_ARTICLES_BUDGET) -> str:
+    """Newest articles as `- [[slug]] — summary (date)` lines, cut to `budget`."""
+    rows = parse_kb_rows(index_md)
+    header = f"{len(rows)} articles total; newest first (search the rest with qmd).\n"
     out = [header]
     size = len(header)
     for slug, summary, updated in rows:
@@ -88,12 +89,6 @@ def compact_kb_index(index_md: str, budget: int = KB_INDEX_BUDGET) -> str:
         out.append(entry)
         size += len(entry) + 1
     return "\n".join(out)
-
-
-def _truncate_head(text: str, budget: int) -> str:
-    if len(text) <= budget:
-        return text
-    return text[:budget].rsplit("\n", 1)[0] + "\n\n...(truncated)"
 
 
 def _tail_lines(text: str, max_lines: int, budget: int) -> str:
@@ -108,61 +103,64 @@ def _tail_lines(text: str, max_lines: int, budget: int) -> str:
     return out
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def count_wiki_pages(wiki_dir: Path = WIKI_DIR) -> int:
+    try:
+        return sum(1 for p in wiki_dir.rglob("*.md") if p.name not in ("index.md", "log.md"))
+    except OSError:
+        return 0
+
+
 def build_context(
     *,
-    wiki_index: str | None,
     kb_index: str | None,
     recent_log: str,
+    wiki_count: int = 0,
     today: datetime | None = None,
 ) -> str:
-    """Assemble the context to inject into the conversation."""
+    """Assemble the briefing. Always shorter than Claude Code's 10k cap."""
     today = today or datetime.now(timezone.utc).astimezone()
-    parts = [f"## Today\n{today.strftime('%A, %B %d, %Y')}"]
+    kb_count = len(parse_kb_rows(kb_index)) if kb_index else 0
 
-    # Wiki index (domain knowledge — what things are)
-    if wiki_index:
-        parts.append(
-            "## Wiki Index (Domain Knowledge)\n\n" + _truncate_head(wiki_index, WIKI_INDEX_BUDGET)
-        )
-
-    # Knowledge base index (engineering lessons — what was learned)
+    parts = [
+        f"## Today\n{today.strftime('%A, %B %d, %Y')}",
+        HOW_TO_SEARCH.format(kb_count=kb_count, wiki_count=wiki_count, project_root=_display_path(PROJECT_ROOT)),
+    ]
     if kb_index:
-        parts.append(
-            "## Knowledge Base Index (Engineering Lessons)\n\n"
-            + compact_kb_index(kb_index, KB_INDEX_BUDGET)
-        )
-    else:
-        parts.append("## Knowledge Base Index\n\n(empty - no articles compiled yet)")
-
-    # Recent daily log
+        parts.append("## Newest knowledge base articles\n\n" + compact_kb_index(kb_index))
     parts.append(
-        "## Recent Daily Log\n\n" + _tail_lines(recent_log, MAX_LOG_LINES, DAILY_LOG_BUDGET)
+        "## Latest daily log (tail)\n\n" + _tail_lines(recent_log, MAX_LOG_LINES, DAILY_LOG_BUDGET)
     )
 
     context = "\n\n---\n\n".join(parts)
-    if len(context) > MAX_CONTEXT_CHARS:  # defensive; budgets above make this unreachable
-        context = context[:MAX_CONTEXT_CHARS] + "\n\n...(truncated)"
+    if len(context) > MAX_CONTEXT_CHARS:  # defensive; the budgets above keep it under
+        context = context[:MAX_CONTEXT_CHARS].rsplit("\n", 1)[0] + "\n\n...(truncated)"
     return context
 
 
 def main():
-    wiki_index = WIKI_INDEX_FILE.read_text(encoding="utf-8") if WIKI_INDEX_FILE.exists() else None
-    kb_index = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else None
+    # Flush/compile agents run Claude Code themselves; they need none of this.
+    if os.environ.get("CLAUDE_INVOKED_BY"):
+        sys.exit(0)
 
+    kb_index = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else None
     context = build_context(
-        wiki_index=wiki_index,
         kb_index=kb_index,
         recent_log=get_recent_log(),
+        wiki_count=count_wiki_pages(),
     )
-
-    output = {
+    print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": context,
         }
-    }
-
-    print(json.dumps(output))
+    }))
 
 
 if __name__ == "__main__":

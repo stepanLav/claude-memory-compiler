@@ -16,7 +16,7 @@ import argparse
 import asyncio
 from pathlib import Path
 
-from config import COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, QA_DIR, now_iso
+from config import AGENT_EXTRA_ARGS, AGENT_SETTING_SOURCES, COMPILE_MODEL, FALLBACK_MODEL, KNOWLEDGE_DIR, QA_DIR, now_iso
 from utils import compact_table_whitespace, load_state, read_wiki_index, save_state
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -94,6 +94,8 @@ consulting the knowledge base below.
                 max_turns=15,
                 model=COMPILE_MODEL,
                 fallback_model=FALLBACK_MODEL,
+                setting_sources=AGENT_SETTING_SOURCES,
+                extra_args=AGENT_EXTRA_ARGS,
             ),
         ):
             if isinstance(message, AssistantMessage):
